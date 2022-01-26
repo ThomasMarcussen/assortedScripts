@@ -11,7 +11,7 @@ If the Pol file has not been modified within the configured amount of days, it w
 
 ### Checklist:
 - Should run with local administrative rights or as system
-- Log file is configured to C:\Windows\CCM\Logs
+- Log file is configured to C:\Windows\Logs
 
 ### Solves the following issues:
 - Stale group policy on clint maskines
@@ -21,7 +21,7 @@ If the Pol file has not been modified within the configured amount of days, it w
 
 $LastModifiedDays = 30
 $FileLocation = "C:\Windows\System32\GroupPolicy\Machine\Registry.pol"
-$LogFileLocation = "C:\Windows\CCM\Logs\Check-GPO-Pol-${LastModifiedDays}-Days.log"
+$LogFileLocation = "C:\Windows\Logs\Check-GPO-Pol-${LastModifiedDays}-Days.log"
 $Date = Get-Date
 $registryFileStatus = Test-Path -Path $FileLocation -PathType Leaf
 
