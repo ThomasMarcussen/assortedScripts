@@ -29,7 +29,8 @@
 		-- User is licensed correctly 
 
 	* Network checks 
-		-- required communication for Intune Autopilot is allowed
+		-- Required communication for Intune Autopilot is allowed
+                -- Updated with multiple URLs
 	
 	Script prerequisites:
 	1. A minimum Windows PowerShell version of '7.2' is required to run this script. The script automatically checks for and installs module if needed.
