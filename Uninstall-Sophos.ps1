@@ -1,3 +1,8 @@
+###################################################################################################################
+# Name: Uninstall-Sophos.ps1
+# Author: Thomas Marcussen, Thomas@ThomasMarcussen.com
+# Date: Feburary,2025
+###################################################################################################################
 <#
 .SYNOPSIS
     This script silently uninstalls Sophos Endpoint (Intercept X) from Windows systems.
@@ -12,14 +17,6 @@
     - Logs all actions to a file for troubleshooting.
     
     It ensures a **silent** execution when deployed via automation but displays progress when run manually from the command line.
-
-.NOTES
-    Author: <Your Name>
-    Date:   <Today's Date>
-    Version: 1.0
-    Tested on: Windows 10/11, Windows Server 2016/2019/2022
-
-#>
 
 # Ensure the script is running as Administrator
 Function Test-Admin {
