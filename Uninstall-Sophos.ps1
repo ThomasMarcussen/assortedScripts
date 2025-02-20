@@ -17,6 +17,7 @@
     - Logs all actions to a file for troubleshooting.
     
     It ensures a **silent** execution when deployed via automation but displays progress when run manually from the command line.
+#>
 
 # Ensure the script is running as Administrator
 Function Test-Admin {
