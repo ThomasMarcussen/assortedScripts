@@ -1,260 +1,272 @@
 ###################################################################################################################
 # Name: Download-OD4BAccount.ps1
 # Author: Thomas Marcussen, Thomas@ThomasMarcussen.com
-# Date: January,2023
+# Date: September, 2025
+# Version: 1.0.2
+# ---------------------------------------------------------------------------------------------------------------
+# CHANGE LOG
+# ---------------------------------------------------------------------------------------------------------------
+# 2025-09-22 (Latest Update)
+#   - Added "-All" parameter to:
+#       • Get-MgUserDriveRootChild
+#       • Get-MgUserDriveItemChild
+#     to ensure all items are retrieved (fixes missing files in large folders).
+#   - Fixed folder traversal:
+#       • Previously $FilePath was reset inside recursion; now path is correctly accumulated.
+#   - Updated Microsoft Graph connection:
+#       • Changed Connect-MgGraph scopes from "Files.Read" to "Files.Read.All","User.Read.All","Directory.Read.All"
+#         for proper cross-user OneDrive access.
+#   - Removed undefined $Job variable from writeFilesReport to avoid runtime errors.
+#   - Improved batching:
+#       • Switched to [math]::Ceiling for batch calculation and added guard against division by zero.
+#   - Ensured destination directories are created before downloading files.
+#   - Minor code clean-up, improved comments, and standardized formatting.
+#
+# 2023-01-xx (Original)
+#   - Initial version of the script.
+# ---------------------------------------------------------------------------------------------------------------
+#
+# Example:
+#   .\Download-OD4BAccount.ps1 -Username User@SampleTenantName.onmicrosoft.com -Destination "D:\OD4B" -ThreadCount 3 -Verbose
+#
+# Script prerequisites:
+#   1. Microsoft Graph PowerShell Module installed on local machine. The script automatically checks for and installs module if needed.
+#
+#   2. An Azure AD user that has an admin consent to approve the following permissions in Microsoft Graph:
+#      Organization.Read.All, User.Read.All, Directory.Read.All, Files.Read.All
 ###################################################################################################################
 
-<#
-    .Example 
-    .\Download-OD4BAccount.ps1 -Username User@SampleTenantName.onmicrosoft.com -Destination "D:\OD4B" -ThreadCount 3 -Verbose
-	
-	Script prerequisites:
-	1. Microsoft Graph PowerShell Module installed on local machine. The script automatically checks for and installs module if needed.
-
-	2. An Azure AD user that has an admin consent to approve the following permissions in Microsoft Graph application in Azure AD apps:
-	Organization.Read.All, User.Read.All, Directory.Read.All
-#>
-
-param ([Parameter(Mandatory)][string] $Username,
-	[Parameter(Mandatory)][string] $Destination,
-	[Parameter(Mandatory)][int] $ThreadCount
+param (
+    [Parameter(Mandatory)][string] $Username,
+    [Parameter(Mandatory)][string] $Destination,
+    [Parameter(Mandatory)][int]    $ThreadCount
 )
 
- function ExpandOD4BFolder {
-	 Param([parameter(Mandatory = $true)] $Folder,
-	[parameter(Mandatory = $true)] $FilePath
+function ExpandOD4BFolder {
+    param(
+        [parameter(Mandatory=$true)] $Folder,
+        [parameter(Mandatory=$true)] [string] $FilePath
     )
-	 write-host Retrieved $Folder.name folder located under $Folder.weburl -ForegroundColor green
-	 $filepath = ($filepath + '/' + $folder.name)
-     write-host $filePath -ForegroundColor yellow
-	 $MGUserDriveItemChild = Get-MgUserDriveItemChild -UserId $Username -DriveId $MGUserDriveID -DriveItemId $Folder.Id
-	 ForEach ($item in $MGUserDriveItemChild) {
-		if ($item.folder.childcount -ne $null) {
-			write-host $item.name is a folder
-			writeFoldersReport -Folder $item
-			$filepath = ""
-			ExpandOD4BFolder -Folder $item -FilePath $filepath
-		}
-		else {
-			writeFilesReport -file $item -filepath $filepath
-			write-host $item.name is a file
-		}
- }
- }
 
+    Write-Host "Retrieved '$($Folder.name)' folder under $($Folder.webUrl)" -ForegroundColor Green
+    $currentPath = ($FilePath.TrimEnd('/')) + '/' + $Folder.name
+    Write-Host $currentPath -ForegroundColor Yellow
+
+    # Ensure we fetch ALL children (handles pagination)
+    $MGUserDriveItemChild = Get-MgUserDriveItemChild -UserId $Username -DriveId $MGUserDriveID -DriveItemId $Folder.Id -All
+
+    foreach ($item in $MGUserDriveItemChild) {
+        if ($null -ne $item.folder -and $null -ne $item.folder.childcount) {
+            Write-Host "'$($item.name)' is a folder"
+            writeFoldersReport -Folder $item
+            ExpandOD4BFolder -Folder $item -FilePath $currentPath
+        }
+        else {
+            Write-Host "'$($item.name)' is a file"
+            writeFilesReport -File $item -FilePath $currentPath
+        }
+    }
+}
 
 function writeFilesReport {
-    Param(
-        [parameter(Mandatory = $true)]
-        $File,
-        [parameter(Mandatory = $true)]
-        $filepath
+    param(
+        [parameter(Mandatory=$true)] $File,
+        [parameter(Mandatory=$true)] [string] $FilePath
     )
 
-	$filepathOnDisk = $File.parentReference.path -replace '/drives/' -replace $MGUserDriveID -replace '/root:' -replace '/','\'
-    $object = [PSCustomObject]@{
-        FileName     = $File.name
-        path         = $filepathOnDisk
-		DriveItemID  = $File.id
-		Job          = $Job
-    }
-    $object | export-csv $Username'_OD4B_Files_Report.csv' -NoClobber -NoTypeInformation -Append
-}
+    $filepathOnDisk = $File.parentReference.path `
+        -replace '/drives/' -replace $MGUserDriveID `
+        -replace '/root:' `
+        -replace '/', '\'
 
+    $object = [PSCustomObject]@{
+        FileName    = $File.name
+        Path        = $filepathOnDisk
+        DriveItemID = $File.id
+    }
+
+    $object | Export-Csv "$($Username)_OD4B_Files_Report.csv" -NoTypeInformation -Append
+}
 
 function writeFoldersReport {
-    Param(
-        [parameter(Mandatory = $true)]
-        $Folder
+    param(
+        [parameter(Mandatory=$true)] $Folder
     )
 
-	$folderpath = $Folder.parentReference.path -replace '/drives/' -replace $MGUserDriveID -replace '/root:' -replace '/','\'
-    $object = [PSCustomObject]@{
-        name       = $Folder.name
-        webUrl     = $Folder.webUrl
-		path       = $Folder.parentReference.path
-		folderPath = $folderpath
-    }
-    $object | export-csv $Username'_OD4B_Folders_Report.csv' -NoClobber -NoTypeInformation -Append
-}
+    $folderpath = $Folder.parentReference.path `
+        -replace '/drives/' -replace $MGUserDriveID `
+        -replace '/root:' `
+        -replace '/', '\'
 
+    $object = [PSCustomObject]@{
+        Name       = $Folder.name
+        WebUrl     = $Folder.webUrl
+        Path       = $Folder.parentReference.path
+        FolderPath = $folderpath
+    }
+
+    $object | Export-Csv "$($Username)_OD4B_Folders_Report.csv" -NoTypeInformation -Append
+}
 
 function createFolders {
-    Param(
-        [parameter(Mandatory = $true)]
-        $OD4BFoldersReport,
-        [parameter(Mandatory = $true)]
-        $Destination
+    param(
+        [parameter(Mandatory=$true)] $OD4BFoldersReport,
+        [parameter(Mandatory=$true)] $Destination
     )
 
-$Folders = Import-Csv $OD4BFoldersReport
+    $Folders = Import-Csv $OD4BFoldersReport
+    foreach ($folderEntry in $Folders) {
+        $folderName = $folderEntry.Name
+        $folderPath = $folderEntry.FolderPath
 
-	foreach ($folderEntry in $Folders) {
-		$folderName = $folderEntry.Name
-		$folderPath = $folderEntry.folderpath
-
-	 if (![string]::IsNullOrWhiteSpace($folderPath)) {
-		 New-Item -Path $Destination\$folderPath -ItemType Directory -ErrorAction SilentlyContinue
-		 Write-Host "SubFolder $Destination\$folderPath created" -f Yellow
-	 }
-	 else {
-	 New-Item -Path $Destination\$folderName -ItemType Directory -ErrorAction SilentlyContinue
-	 Write-Host "Root Folder $Destination\$folderName created" -f Yellow
-	 }
-	}
+        if (![string]::IsNullOrWhiteSpace($folderPath)) {
+            New-Item -Path (Join-Path $Destination $folderPath) -ItemType Directory -ErrorAction SilentlyContinue | Out-Null
+            Write-Host "SubFolder $(Join-Path $Destination $folderPath) created" -ForegroundColor Yellow
+        }
+        else {
+            New-Item -Path (Join-Path $Destination $folderName) -ItemType Directory -ErrorAction SilentlyContinue | Out-Null
+            Write-Host "Root Folder $(Join-Path $Destination $folderName) created" -ForegroundColor Yellow
+        }
+    }
 }
-
 
 function createBatches {
-    Param(
-        [parameter(Mandatory = $true)]
-        $OD4BFilesReport,
-        [parameter(Mandatory = $true)]
-        $ThreadCount
+    param(
+        [parameter(Mandatory=$true)] $OD4BFilesReport,
+        [parameter(Mandatory=$true)] [int] $ThreadCount
     )
-	
-	Get-ChildItem -Name batch* | Remove-Item -Force
-	$Files = Import-Csv $OD4BFilesReport
-	$OutputFilenamePattern = 'batch_'
-	$LineLimit = [math]::Floor($Files.count / $ThreadCount)
-	$line = 0
-	$i = 0
-	$file = 0
-	$start = 0
-	while ($line -le $Files.Length) {
-    if ($i -eq $LineLimit -Or $line -eq $Files.Length) {
+
+    Get-ChildItem -Name "batch_*" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+    $Files = Import-Csv $OD4BFilesReport
+    if (-not $Files -or $Files.Count -eq 0) { return }
+
+    $OutputFilenamePattern = 'batch_'
+    $LineLimit = [math]::Ceiling($Files.Count / [math]::Max(1,$ThreadCount))
+    $file = 0
+
+    for ($start = 0; $start -lt $Files.Count; $start += $LineLimit) {
         $file++
-        $Filename = "$OutputFilenamePattern$file"
-        $Files[$start..($line - 1)] | export-csv $Filename'_'$Username'_OD4B_Files_Report.csv' -NoTypeInformation -Force
-        $start = $line;
-        $i = 0
+        $end = [math]::Min($start + $LineLimit - 1, $Files.Count - 1)
+        $Filename = "$OutputFilenamePattern$file" + "_${Username}_OD4B_Files_Report.csv"
+        $Files[$start..$end] | Export-Csv $Filename -NoTypeInformation -Force
         Write-Host "Created batch file $Filename"
-		}
-    $i++;
-    $line++
-	}
-
+    }
 }
-
 
 function downloadFiles {
-    Param(
-        [parameter(Mandatory = $true)]
-        $Username,
-		[parameter(Mandatory = $true)]
-        $MGUserDriveID,
-		[parameter(Mandatory = $true)]
-        $Destination,
-        [parameter(Mandatory = $true)]
-        $ThreadCount
-    )
-
-$ScriptBlock = {
     param(
-        $list = $null,
-		$Destination = "D:\OD4B",
-		$Username = $null,
-		$MGUserDriveID = $null
+        [parameter(Mandatory=$true)] $Username,
+        [parameter(Mandatory=$true)] $MGUserDriveID,
+        [parameter(Mandatory=$true)] $Destination,
+        [parameter(Mandatory=$true)] [int] $ThreadCount
     )
 
-        foreach($fileEntry in $list) {
-		$FilePath = $fileEntry.path
-		$DriveItemID = $fileEntry.DriveItemID
-		Get-MgUserDriveItemContent -DriveId $MGUserDriveID -UserId $Username -DriveItemId $DriveItemID -outfile "$Destination$FilePath"
-		}
-}
+    $ScriptBlock = {
+        param(
+            $list = $null,
+            $Destination = "D:\OD4B",
+            $Username = $null,
+            $MGUserDriveID = $null
+        )
 
-$MaxRunspaces = $ThreadCount+1
-$RunspacePool = [runspacefactory]::CreateRunspacePool(1, $MaxRunspaces)
-$RunspacePool.Open()
-$Jobs = New-Object System.Collections.ArrayList
-$Filenames = Get-ChildItem -Name batch*
+        foreach ($fileEntry in $list) {
+            $FilePath    = $fileEntry.Path
+            $DriveItemID = $fileEntry.DriveItemID
+            $outFile     = "$Destination$FilePath"
 
-foreach ($File in $Filenames) {
-	$batch = Import-Csv $File
-    Write-Host "Creating runspace for $File"
-    $PowerShell = [powershell]::Create()
-	$PowerShell.RunspacePool = $RunspacePool
-    $PowerShell.AddScript($ScriptBlock).AddParameter("list",$batch).AddParameter("Destination",$Destination).AddParameter("Username",$Username).AddParameter("MGUserDriveID",$MGUserDriveID) | Out-Null
-    
-    $JobObj = New-Object -TypeName PSObject -Property @{
-		Runspace = $PowerShell.BeginInvoke()
-		PowerShell = $PowerShell  
+            $dir = Split-Path -Path $outFile -Parent
+            if (-not (Test-Path -LiteralPath $dir)) {
+                New-Item -ItemType Directory -Path $dir -Force | Out-Null
+            }
+
+            try {
+                Get-MgUserDriveItemContent -DriveId $MGUserDriveID -UserId $Username -DriveItemId $DriveItemID -OutFile $outFile -ErrorAction Stop
+            }
+            catch {
+                Write-Warning "Failed to download $($fileEntry.FileName) to $outFile. $_"
+            }
+        }
     }
 
-    $Jobs.Add($JobObj) | Out-Null
+    $MaxRunspaces = [math]::Max(1, $ThreadCount)
+    $RunspacePool = [RunspaceFactory]::CreateRunspacePool(1, $MaxRunspaces)
+    $RunspacePool.Open()
+    $Jobs = New-Object System.Collections.ArrayList
+    $Filenames = Get-ChildItem -Name "batch_*_${Username}_OD4B_Files_Report.csv"
+
+    foreach ($File in $Filenames) {
+        $batch = Import-Csv $File
+        Write-Host "Creating runspace for $File"
+        $PowerShell = [PowerShell]::Create()
+        $PowerShell.RunspacePool = $RunspacePool
+        $null = $PowerShell.AddScript($ScriptBlock).AddParameter("list",$batch).AddParameter("Destination",$Destination).AddParameter("Username",$Username).AddParameter("MGUserDriveID",$MGUserDriveID)
+
+        $JobObj = [PSCustomObject]@{
+            Runspace   = $PowerShell.BeginInvoke()
+            PowerShell = $PowerShell
+        }
+        $Jobs.Add($JobObj) | Out-Null
+    }
+
+    while ($Jobs.Runspace.IsCompleted -contains $false) {
+        Write-Host (Get-Date).ToString() "Still running..."
+        Start-Sleep 1
+    }
 }
 
-while ($Jobs.Runspace.IsCompleted -contains $false) {
-    Write-Host (Get-date).Tostring() "Still running..."
-	Start-Sleep 1
+# -------------------- Main --------------------
+
+$stopwatchScript = [System.Diagnostics.Stopwatch]::StartNew()
+
+if (-not (Get-InstalledModule -Name Microsoft.Graph -MinimumVersion 1.9.6 -ErrorAction SilentlyContinue)) {
+    Install-Module Microsoft.Graph -Scope CurrentUser -Force -AllowClobber
 }
 
-}
-
-$stopwatchScript =  [system.diagnostics.stopwatch]::StartNew()
-
-if (-not(Get-InstalledModule -Name Microsoft.graph -MinimumVersion 1.9.6)) {Install-Module microsoft.graph -scope CurrentUser  -Force -AllowClobber}
-
-Write-host "`nConnecting to Microsoft Graph API. If not authenticated already in this PowerShell session, you will be prompted for your Azure AD credentials. `n`nPlease use an account with following permissions: Organization.Read.All, User.Read.All, Directory.Read.All`n"
-
-Connect-MgGraph -Scopes "Files.Read"
-
-Write-host "`nConnected Successfully to Microsoft Graph API."
-
+Write-Host "`nConnecting to Microsoft Graph API..."
+Connect-MgGraph -Scopes "Files.Read.All","User.Read.All","Directory.Read.All"
+Write-Host "Connected successfully."
 Select-MgProfile v1.0
 
-Write-host "`nFetching User Drive ID"
+Write-Host "`nFetching User Drive ID..."
+$MGUserDriveID = (Get-MgUserDrive -UserId $Username).Id
+Write-Host "User Drive ID: $MGUserDriveID"
 
-$MGUserDriveID = (Get-MgUserDrive -UserId $Username).id
-
-Write-host "`nUser Drive ID" $MGUserDriveID
-
-$MGUserDriveRootChild = Get-MgUserDriveRootChild -UserId $Username -DriveId $MGUserDriveID
-
-if (!(Test-Path $Destination)) {
-  New-Item -Path $Destination -ItemType Directory
+if (!(Test-Path -LiteralPath $Destination)) {
+    New-Item -Path $Destination -ItemType Directory | Out-Null
 }
 
-if (Test-Path $Username'_OD4B_Folders_Report.csv') {
-  Remove-Item $Username'_OD4B_Folders_Report.csv'
-}
+$foldersReport = "$($Username)_OD4B_Folders_Report.csv"
+$filesReport   = "$($Username)_OD4B_Files_Report.csv"
+if (Test-Path $foldersReport) { Remove-Item $foldersReport -Force }
+if (Test-Path $filesReport)   { Remove-Item $filesReport   -Force }
 
-if (Test-Path $Username'_OD4B_Files_Report.csv') {
-  Remove-Item $Username'_OD4B_Files_Report.csv'
-}
+Write-Host -ForegroundColor White -BackgroundColor Red "`nFetching OneDrive content (this may take a while)..."
+$stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 
-Write-host -ForegroundColor White -BackgroundColor Red "`nFetching OneDrive content"
+$MGUserDriveRootChild = Get-MgUserDriveRootChild -UserId $Username -DriveId $MGUserDriveID -All
 
-$stopwatch =  [system.diagnostics.stopwatch]::StartNew()
-
-ForEach ($item in $MGUserDriveRootChild) {
-	if ($item.folder.childcount -ne $null) {
-		write-host $item.name is a folder
-		$filepath = ""
-		writeFoldersReport -Folder $item
-		ExpandOD4BFolder -Folder $item -filepath $filepath
+foreach ($item in $MGUserDriveRootChild) {
+    if ($null -ne $item.folder -and $null -ne $item.folder.childcount) {
+        Write-Host "'$($item.name)' is a folder"
+        writeFoldersReport -Folder $item
+        ExpandOD4BFolder -Folder $item -FilePath ""
     }
-	else {
-		write-host $item.name is a file
-		$filepath = ""
-		writeFilesReport -file $item -filepath $filepath
-	}
- }
- 
+    else {
+        Write-Host "'$($item.name)' is a file"
+        writeFilesReport -File $item -FilePath ""
+    }
+}
+
 $stopwatch.Stop()
-Write-host -ForegroundColor White -BackgroundColor Red "`nFetching OneDrive content COMPLETED at" $stopwatch.Elapsed
+Write-Host -ForegroundColor White -BackgroundColor Red ("`nFetching OneDrive content COMPLETED in {0}" -f $stopwatch.Elapsed)
 
-createFolders -OD4BFoldersReport $Username'_OD4B_Folders_Report.csv' -Destination $Destination
+createFolders -OD4BFoldersReport $foldersReport -Destination $Destination
+createBatches -OD4BFilesReport $filesReport -ThreadCount $ThreadCount
 
-createBatches -OD4BFilesReport $Username'_OD4B_Files_Report.csv' -ThreadCount $ThreadCount
-
-$stopwatch =  [system.diagnostics.stopwatch]::StartNew()
-
+$stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 downloadFiles -Username $Username -MGUserDriveID $MGUserDriveID -Destination $Destination -ThreadCount $ThreadCount
-
 $stopwatch.Stop()
-Write-host -ForegroundColor White -BackgroundColor Red "`nDownload COMPLETED at" $stopwatch.Elapsed
+Write-Host -ForegroundColor White -BackgroundColor Red ("`nDownload COMPLETED in {0}" -f $stopwatch.Elapsed)
 
 $stopwatchScript.Stop()
-Write-host -ForegroundColor White -BackgroundColor Green "`nScript COMPLETED at" $stopwatchScript.Elapsed
+Write-Host -ForegroundColor White -BackgroundColor Green ("`nScript COMPLETED in {0}" -f $stopwatchScript.Elapsed)
