@@ -1,189 +1,272 @@
 ###################################################################################################################
 # Name: Download-OD4BAccount.ps1
 # Author: Thomas Marcussen, Thomas@ThomasMarcussen.com
-# Date: September, 2025
-# Version: 1.0.2
+# Date: October 28, 2025
+# Version: 1.0.3
 # ---------------------------------------------------------------------------------------------------------------
 # CHANGE LOG
 # ---------------------------------------------------------------------------------------------------------------
-# 2025-09-22 (Latest Update)
-#   - Added "-All" parameter to:
-#       • Get-MgUserDriveRootChild
-#       • Get-MgUserDriveItemChild
-#     to ensure all items are retrieved (fixes missing files in large folders).
-#   - Fixed folder traversal:
-#       • Previously $FilePath was reset inside recursion; now path is correctly accumulated.
-#   - Updated Microsoft Graph connection:
-#       • Changed Connect-MgGraph scopes from "Files.Read" to "Files.Read.All","User.Read.All","Directory.Read.All"
-#         for proper cross-user OneDrive access.
-#   - Removed undefined $Job variable from writeFilesReport to avoid runtime errors.
-#   - Improved batching:
-#       • Switched to [math]::Ceiling for batch calculation and added guard against division by zero.
-#   - Ensured destination directories are created before downloading files.
-#   - Minor code clean-up, improved comments, and standardized formatting.
+# 2025-10-28
+#   - Switch downloads to /content via Invoke-MgGraphRequest -OutputFilePath (no dependency on @microsoft.graph.downloadUrl).
+#   - Full support for OneDrive "shortcuts" (remoteItem): follow remote driveId/itemId for folders and files.
+#   - Paths are built from the visible OneDrive hierarchy (shortcut names included).
+#   - Keep original CSV reports + multithreaded download; import Graph auth module inside worker runspaces.
 #
-# 2023-01-xx (Original)
-#   - Initial version of the script.
+# 2025-09-22
+#   - Pagination handling, recursion path, broader scopes, batching improvements.
+#
+# 2023-01-xx
+#   - Initial version.
 # ---------------------------------------------------------------------------------------------------------------
 #
 # Example:
-#   .\Download-OD4BAccount.ps1 -Username User@SampleTenantName.onmicrosoft.com -Destination "D:\OD4B" -ThreadCount 3 -Verbose
+#   .\Download-OD4BAccount.ps1 -Username User@Tenant.onmicrosoft.com -Destination "D:\OD4B" -ThreadCount 3 -Verbose
 #
-# Script prerequisites:
-#   1. Microsoft Graph PowerShell Module installed on local machine. The script automatically checks for and installs module if needed.
-#
-#   2. An Azure AD user that has an admin consent to approve the following permissions in Microsoft Graph:
-#      Organization.Read.All, User.Read.All, Directory.Read.All, Files.Read.All
+# Prerequisites:
+#   1) Microsoft Graph PowerShell Authentication module (auto-installs if missing)
+#   2) Admin consent for: Organization.Read.All, User.Read.All, Directory.Read.All, Files.Read.All
 ###################################################################################################################
 
+[CmdletBinding()]
 param (
-    [Parameter(Mandatory)][string] $Username,
-    [Parameter(Mandatory)][string] $Destination,
-    [Parameter(Mandatory)][int]    $ThreadCount
+    [Parameter(Mandatory)] [string] $Username,
+    [Parameter(Mandatory)] [string] $Destination,
+    [Parameter(Mandatory)] [int]    $ThreadCount
 )
 
-function ExpandOD4BFolder {
-    param(
-        [parameter(Mandatory=$true)] $Folder,
-        [parameter(Mandatory=$true)] [string] $FilePath
-    )
+# Script-scoped vars used across functions
+$script:Username      = $Username
+$script:UserId        = $null
+$script:MGUserDriveID = $null
+$GraphRoot            = '/v1.0'
 
-    Write-Host "Retrieved '$($Folder.name)' folder under $($Folder.webUrl)" -ForegroundColor Green
-    $currentPath = ($FilePath.TrimEnd('/')) + '/' + $Folder.name
-    Write-Host $currentPath -ForegroundColor Yellow
+# -------------------- Minimal Graph Authentication Bootstrap --------------------
+function Ensure-GraphAuth {
+    [CmdletBinding()]
+    param()
 
-    # Ensure we fetch ALL children (handles pagination)
-    $MGUserDriveItemChild = Get-MgUserDriveItemChild -UserId $Username -DriveId $MGUserDriveID -DriveItemId $Folder.Id -All
-
-    foreach ($item in $MGUserDriveItemChild) {
-        if ($null -ne $item.folder -and $null -ne $item.folder.childcount) {
-            Write-Host "'$($item.name)' is a folder"
-            writeFoldersReport -Folder $item
-            ExpandOD4BFolder -Folder $item -FilePath $currentPath
+    try {
+        if ($PSVersionTable.PSVersion.Major -lt 7) {
+            [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
         }
-        else {
-            Write-Host "'$($item.name)' is a file"
-            writeFilesReport -File $item -FilePath $currentPath
+    } catch {}
+
+    if (-not (Get-PSRepository -Name 'PSGallery' -ErrorAction SilentlyContinue)) {
+        Register-PSRepository -Default -ErrorAction SilentlyContinue
+    }
+
+    if (-not (Get-InstalledModule -Name Microsoft.Graph.Authentication -ErrorAction SilentlyContinue)) {
+        Install-Module Microsoft.Graph.Authentication -Scope CurrentUser -Force -AllowClobber -ErrorAction Stop
+    }
+
+    if (-not (Get-Module -Name Microsoft.Graph.Authentication -ErrorAction SilentlyContinue)) {
+        Import-Module Microsoft.Graph.Authentication -ErrorAction Stop
+    }
+}
+
+# -------------------- Graph helpers (Invoke-MgGraphRequest) --------------------
+function Invoke-GraphGet {
+    param(
+        [Parameter(Mandatory)] [string] $RelativeUrl
+    )
+    # PSObject output makes property access reliable in PS 5.1
+    Invoke-MgGraphRequest -Method GET -Uri $RelativeUrl -OutputType PSObject -ErrorAction Stop
+}
+
+function Get-GraphPaged {
+    param(
+        [Parameter(Mandatory)] [string] $RelativeUrl
+    )
+    $all = New-Object System.Collections.ArrayList
+    $next = $RelativeUrl
+    while ($next) {
+        $resp = Invoke-MgGraphRequest -Method GET -Uri $next -OutputType PSObject -ErrorAction Stop
+        if ($resp.value) { [void]$all.AddRange($resp.value) }
+        $next = $resp.'@odata.nextLink'
+    }
+    return $all
+}
+
+# -------------------- CSV writers --------------------
+function Add-FolderRow {
+    param(
+        [Parameter(Mandatory)] [string] $FolderPath,
+        [Parameter()] [string] $Name,
+        [Parameter()] [string] $WebUrl
+    )
+
+    if (-not $Name) { $Name = Split-Path -Path $FolderPath -Leaf }
+    [PSCustomObject]@{
+        Name       = $Name
+        WebUrl     = $WebUrl
+        FolderPath = $FolderPath
+    } | Export-Csv ('{0}_OD4B_Folders_Report.csv' -f $script:Username) -NoTypeInformation -Append
+}
+
+function Add-FileRow {
+    param(
+        [Parameter(Mandatory)] [string] $DriveId,
+        [Parameter(Mandatory)] [string] $ItemId,
+        [Parameter(Mandatory)] [string] $RelativePath, # includes filename
+        [Parameter(Mandatory)] [string] $FileName
+    )
+
+    [PSCustomObject]@{
+        FileName     = $FileName
+        Path         = $RelativePath
+        DriveItemID  = $ItemId
+        DriveId      = $DriveId
+    } | Export-Csv ('{0}_OD4B_Files_Report.csv' -f $script:Username) -NoTypeInformation -Append
+}
+
+# -------------------- Traversal (handles shortcuts/remoteItem) --------------------
+function Traverse-Drive {
+    param(
+        [Parameter(Mandatory)] [string] $DriveId,
+        [Parameter()]            [string] $ItemId,      # if empty => root
+        [Parameter()]            [string] $DisplayPath  # visible path in user's OneDrive view
+    )
+
+    $select = 'id,name,size,folder,file,package,remoteItem,webUrl,parentReference'
+    $uri = if ($ItemId) {
+        ('{0}/drives/{1}/items/{2}/children?$select={3}' -f $GraphRoot, $DriveId, $ItemId, $select)
+    } else {
+        ('{0}/drives/{1}/root/children?$select={2}' -f $GraphRoot, $DriveId, $select)
+    }
+
+    $children = Get-GraphPaged -RelativeUrl $uri
+
+    foreach ($item in $children) {
+        # If this is a shortcut to a remote folder
+        if ($item.folder -and $item.remoteItem -and $item.remoteItem.folder) {
+            $newPath = if ($DisplayPath) { ('{0}\{1}' -f $DisplayPath, $item.name) } else { $item.name }
+            Add-FolderRow -FolderPath $newPath -Name $item.name -WebUrl $item.webUrl
+
+            $remoteDriveId = $item.remoteItem.parentReference.driveId
+            $remoteItemId  = $item.remoteItem.id
+            if ($remoteDriveId -and $remoteItemId) {
+                Traverse-Drive -DriveId $remoteDriveId -ItemId $remoteItemId -DisplayPath $newPath
+            } else {
+                Write-Warning ('Shortcut folder missing remote drive info: {0}' -f $item.name)
+            }
+            continue
         }
+
+        # Shortcut to a remote FILE
+        if ($item.file -and $item.remoteItem -and $item.remoteItem.file) {
+            $relPath = if ($DisplayPath) { ('{0}\{1}' -f $DisplayPath, $item.name) } else { $item.name }
+            $remoteDriveId = $item.remoteItem.parentReference.driveId
+            $remoteItemId  = $item.remoteItem.id
+            if ($remoteDriveId -and $remoteItemId) {
+                Add-FileRow -DriveId $remoteDriveId -ItemId $remoteItemId -RelativePath $relPath -FileName $item.name
+            } else {
+                Write-Warning ('Shortcut file missing remote drive info: {0}' -f $item.name)
+            }
+            continue
+        }
+
+        # Regular folder in this drive
+        if ($item.folder -and -not $item.remoteItem) {
+            $newPath = if ($DisplayPath) { ('{0}\{1}' -f $DisplayPath, $item.name) } else { $item.name }
+            Add-FolderRow -FolderPath $newPath -Name $item.name -WebUrl $item.webUrl
+            Traverse-Drive -DriveId $DriveId -ItemId $item.id -DisplayPath $newPath
+            continue
+        }
+
+        # Regular file in this drive
+        if ($item.file -and -not $item.remoteItem) {
+            $relPath = if ($DisplayPath) { ('{0}\{1}' -f $DisplayPath, $item.name) } else { $item.name }
+            Add-FileRow -DriveId $DriveId -ItemId $item.id -RelativePath $relPath -FileName $item.name
+            continue
+        }
+
+        # Non-file things (packages, etc.)
+        Write-Warning ('Skipping non-file item: {0} (id: {1})' -f $item.name, $item.id)
     }
 }
 
-function writeFilesReport {
-    param(
-        [parameter(Mandatory=$true)] $File,
-        [parameter(Mandatory=$true)] [string] $FilePath
-    )
-
-    $filepathOnDisk = $File.parentReference.path `
-        -replace '/drives/' -replace $MGUserDriveID `
-        -replace '/root:' `
-        -replace '/', '\'
-
-    $object = [PSCustomObject]@{
-        FileName    = $File.name
-        Path        = $filepathOnDisk
-        DriveItemID = $File.id
-    }
-
-    $object | Export-Csv "$($Username)_OD4B_Files_Report.csv" -NoTypeInformation -Append
-}
-
-function writeFoldersReport {
-    param(
-        [parameter(Mandatory=$true)] $Folder
-    )
-
-    $folderpath = $Folder.parentReference.path `
-        -replace '/drives/' -replace $MGUserDriveID `
-        -replace '/root:' `
-        -replace '/', '\'
-
-    $object = [PSCustomObject]@{
-        Name       = $Folder.name
-        WebUrl     = $Folder.webUrl
-        Path       = $Folder.parentReference.path
-        FolderPath = $folderpath
-    }
-
-    $object | Export-Csv "$($Username)_OD4B_Folders_Report.csv" -NoTypeInformation -Append
-}
-
+# -------------------- Local folder & batch creation --------------------
 function createFolders {
     param(
-        [parameter(Mandatory=$true)] $OD4BFoldersReport,
-        [parameter(Mandatory=$true)] $Destination
+        [Parameter(Mandatory)] $OD4BFoldersReport,
+        [Parameter(Mandatory)] $Destination
     )
 
     $Folders = Import-Csv $OD4BFoldersReport
     foreach ($folderEntry in $Folders) {
-        $folderName = $folderEntry.Name
         $folderPath = $folderEntry.FolderPath
-
-        if (![string]::IsNullOrWhiteSpace($folderPath)) {
-            New-Item -Path (Join-Path $Destination $folderPath) -ItemType Directory -ErrorAction SilentlyContinue | Out-Null
-            Write-Host "SubFolder $(Join-Path $Destination $folderPath) created" -ForegroundColor Yellow
-        }
-        else {
-            New-Item -Path (Join-Path $Destination $folderName) -ItemType Directory -ErrorAction SilentlyContinue | Out-Null
-            Write-Host "Root Folder $(Join-Path $Destination $folderName) created" -ForegroundColor Yellow
-        }
+        if ([string]::IsNullOrWhiteSpace($folderPath)) { continue }
+        $full = Join-Path $Destination $folderPath
+        New-Item -Path $full -ItemType Directory -ErrorAction SilentlyContinue | Out-Null
+        Write-Host ('Folder ensured: {0}' -f $full) -ForegroundColor Yellow
     }
 }
 
 function createBatches {
     param(
-        [parameter(Mandatory=$true)] $OD4BFilesReport,
-        [parameter(Mandatory=$true)] [int] $ThreadCount
+        [Parameter(Mandatory)] $OD4BFilesReport,
+        [Parameter(Mandatory)] [int] $ThreadCount
     )
 
-    Get-ChildItem -Name "batch_*" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+    Get-ChildItem -Name 'batch_*' -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
     $Files = Import-Csv $OD4BFilesReport
     if (-not $Files -or $Files.Count -eq 0) { return }
 
     $OutputFilenamePattern = 'batch_'
-    $LineLimit = [math]::Ceiling($Files.Count / [math]::Max(1,$ThreadCount))
+    $LineLimit = [math]::Ceiling($Files.Count / [math]::Max(1, $ThreadCount))
     $file = 0
 
     for ($start = 0; $start -lt $Files.Count; $start += $LineLimit) {
         $file++
         $end = [math]::Min($start + $LineLimit - 1, $Files.Count - 1)
-        $Filename = "$OutputFilenamePattern$file" + "_${Username}_OD4B_Files_Report.csv"
+        $Filename = ('{0}{1}_{2}_OD4B_Files_Report.csv' -f $OutputFilenamePattern, $file, $script:Username)
         $Files[$start..$end] | Export-Csv $Filename -NoTypeInformation -Force
-        Write-Host "Created batch file $Filename"
+        Write-Host ('Created batch file {0}' -f $Filename)
     }
 }
 
+# -------------------- Downloads (multi-threaded via /content) --------------------
 function downloadFiles {
     param(
-        [parameter(Mandatory=$true)] $Username,
-        [parameter(Mandatory=$true)] $MGUserDriveID,
-        [parameter(Mandatory=$true)] $Destination,
-        [parameter(Mandatory=$true)] [int] $ThreadCount
+        [Parameter(Mandatory)] [string] $Destination,
+        [Parameter(Mandatory)] [int]    $ThreadCount,
+        [Parameter(Mandatory)] [string] $GraphRootParam
     )
 
     $ScriptBlock = {
         param(
             $list = $null,
-            $Destination = "D:\OD4B",
-            $Username = $null,
-            $MGUserDriveID = $null
+            [string] $Destination,
+            [string] $GraphRootParam
         )
 
-        foreach ($fileEntry in $list) {
-            $FilePath    = $fileEntry.Path
-            $DriveItemID = $fileEntry.DriveItemID
-            $outFile     = "$Destination$FilePath"
+        # Ensure the auth cmdlet exists in the worker and use the existing session
+        Import-Module Microsoft.Graph.Authentication -ErrorAction Stop
 
-            $dir = Split-Path -Path $outFile -Parent
+        foreach ($fileEntry in $list) {
+            $fileName    = $fileEntry.FileName
+            $relative    = $fileEntry.Path
+            $driveId     = $fileEntry.DriveId
+            $itemId      = $fileEntry.DriveItemID
+
+            if (-not $driveId -or -not $itemId) {
+                Write-Warning ('Missing drive/item id for {0} - skipped.' -f $fileName)
+                continue
+            }
+
+            $localPath = Join-Path -Path $Destination -ChildPath $relative
+            $dir = Split-Path -Path $localPath -Parent
             if (-not (Test-Path -LiteralPath $dir)) {
                 New-Item -ItemType Directory -Path $dir -Force | Out-Null
             }
 
+            $uri = ('{0}/drives/{1}/items/{2}/content' -f $GraphRootParam, $driveId, $itemId)
             try {
-                Get-MgUserDriveItemContent -DriveId $MGUserDriveID -UserId $Username -DriveItemId $DriveItemID -OutFile $outFile -ErrorAction Stop
+                # Streams the content to disk using your current Graph session
+                Invoke-MgGraphRequest -Method GET -Uri $uri -OutputFilePath $localPath -ErrorAction Stop | Out-Null
             }
             catch {
-                Write-Warning "Failed to download $($fileEntry.FileName) to $outFile. $_"
+                Write-Warning ('Failed to download {0} to {1}. {2}' -f $fileName, $localPath, $_.Exception.Message)
             }
         }
     }
@@ -192,14 +275,17 @@ function downloadFiles {
     $RunspacePool = [RunspaceFactory]::CreateRunspacePool(1, $MaxRunspaces)
     $RunspacePool.Open()
     $Jobs = New-Object System.Collections.ArrayList
-    $Filenames = Get-ChildItem -Name "batch_*_${Username}_OD4B_Files_Report.csv"
+    $Filenames = Get-ChildItem -Name ('batch_*_{0}_OD4B_Files_Report.csv' -f $script:Username)
 
     foreach ($File in $Filenames) {
         $batch = Import-Csv $File
-        Write-Host "Creating runspace for $File"
+        Write-Host ('Creating runspace for {0}' -f $File)
         $PowerShell = [PowerShell]::Create()
         $PowerShell.RunspacePool = $RunspacePool
-        $null = $PowerShell.AddScript($ScriptBlock).AddParameter("list",$batch).AddParameter("Destination",$Destination).AddParameter("Username",$Username).AddParameter("MGUserDriveID",$MGUserDriveID)
+        $null = $PowerShell.AddScript($ScriptBlock).
+            AddParameter('list', $batch).
+            AddParameter('Destination', $Destination).
+            AddParameter('GraphRootParam', $GraphRootParam)
 
         $JobObj = [PSCustomObject]@{
             Runspace   = $PowerShell.BeginInvoke()
@@ -209,64 +295,86 @@ function downloadFiles {
     }
 
     while ($Jobs.Runspace.IsCompleted -contains $false) {
-        Write-Host (Get-Date).ToString() "Still running..."
+        Write-Host ((Get-Date).ToString() + ' Still running...')
         Start-Sleep 1
     }
+
+    foreach ($job in $Jobs) {
+        try { $job.PowerShell.EndInvoke($job.Runspace) } catch {}
+        finally { $job.PowerShell.Dispose() }
+    }
+    $RunspacePool.Close()
+    $RunspacePool.Dispose()
 }
 
 # -------------------- Main --------------------
 
 $stopwatchScript = [System.Diagnostics.Stopwatch]::StartNew()
 
-if (-not (Get-InstalledModule -Name Microsoft.Graph -MinimumVersion 1.9.6 -ErrorAction SilentlyContinue)) {
-    Install-Module Microsoft.Graph -Scope CurrentUser -Force -AllowClobber
-}
+Ensure-GraphAuth
 
 Write-Host "`nConnecting to Microsoft Graph API..."
-Connect-MgGraph -Scopes "Files.Read.All","User.Read.All","Directory.Read.All"
-Write-Host "Connected successfully."
-Select-MgProfile v1.0
+$requiredScopes = @('Files.Read.All', 'User.Read.All', 'Directory.Read.All')
+Connect-MgGraph -Scopes $requiredScopes
+Write-Host 'Connected successfully.'
 
-Write-Host "`nFetching User Drive ID..."
-$MGUserDriveID = (Get-MgUserDrive -UserId $Username).Id
-Write-Host "User Drive ID: $MGUserDriveID"
+# Optional: warn if scopes missing
+try {
+    $ctx = Get-MgContext
+    $missing = $requiredScopes | Where-Object { $_ -notin $ctx.Scopes }
+    if ($missing) { Write-Warning ('Missing scopes: {0}. Admin consent may be required.' -f ($missing -join ', ')) }
+} catch {
+    Write-Verbose 'Get-MgContext unavailable; continuing.' -Verbose
+}
 
-if (!(Test-Path -LiteralPath $Destination)) {
+# Resolve user and drive
+Write-Host "`nResolving user and drive via Graph..."
+try {
+    $user = Invoke-GraphGet -RelativeUrl ('{0}/users/{1}?$select=id,userPrincipalName' -f $GraphRoot, $Username)
+    $script:UserId = $user.id
+} catch {
+    throw ('Failed to resolve user {0}. {1}' -f $Username, $_.Exception.Message)
+}
+
+try {
+    $drive = Invoke-GraphGet -RelativeUrl ('{0}/users/{1}/drive?$select=id' -f $GraphRoot, $script:UserId)
+    $script:MGUserDriveID = $drive.id
+} catch {
+    throw ('Failed to resolve OneDrive for user {0}. If the user never opened OneDrive, it may not be provisioned.' -f $Username)
+}
+
+Write-Host ('User ID: {0}' -f $script:UserId)
+Write-Host ('Drive ID: {0}' -f $script:MGUserDriveID)
+
+# Prepare destination and reports
+if (-not (Test-Path -LiteralPath $Destination)) {
     New-Item -Path $Destination -ItemType Directory | Out-Null
 }
 
-$foldersReport = "$($Username)_OD4B_Folders_Report.csv"
-$filesReport   = "$($Username)_OD4B_Files_Report.csv"
-if (Test-Path $foldersReport) { Remove-Item $foldersReport -Force }
-if (Test-Path $filesReport)   { Remove-Item $filesReport   -Force }
+$foldersReport = ('{0}_OD4B_Folders_Report.csv' -f $Username)
+$filesReport   = ('{0}_OD4B_Files_Report.csv'   -f $Username)
+foreach ($rep in @($foldersReport, $filesReport)) {
+    if (Test-Path $rep) { Remove-Item $rep -Force }
+}
 
+# Enumerate OneDrive content (root -> recurse); handles remoteItem
 Write-Host -ForegroundColor White -BackgroundColor Red "`nFetching OneDrive content (this may take a while)..."
 $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 
-$MGUserDriveRootChild = Get-MgUserDriveRootChild -UserId $Username -DriveId $MGUserDriveID -All
-
-foreach ($item in $MGUserDriveRootChild) {
-    if ($null -ne $item.folder -and $null -ne $item.folder.childcount) {
-        Write-Host "'$($item.name)' is a folder"
-        writeFoldersReport -Folder $item
-        ExpandOD4BFolder -Folder $item -FilePath ""
-    }
-    else {
-        Write-Host "'$($item.name)' is a file"
-        writeFilesReport -File $item -FilePath ""
-    }
-}
+Traverse-Drive -DriveId $script:MGUserDriveID -ItemId $null -DisplayPath ''
 
 $stopwatch.Stop()
-Write-Host -ForegroundColor White -BackgroundColor Red ("`nFetching OneDrive content COMPLETED in {0}" -f $stopwatch.Elapsed)
+Write-Host -ForegroundColor White -BackgroundColor Red ('`nFetching OneDrive content COMPLETED in {0}' -f $stopwatch.Elapsed)
 
+# Recreate folder tree locally and split into batches for parallel downloads
 createFolders -OD4BFoldersReport $foldersReport -Destination $Destination
-createBatches -OD4BFilesReport $filesReport -ThreadCount $ThreadCount
+createBatches -OD4BFilesReport   $filesReport   -ThreadCount $ThreadCount
 
+# Download phase (parallel via /content)
 $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
-downloadFiles -Username $Username -MGUserDriveID $MGUserDriveID -Destination $Destination -ThreadCount $ThreadCount
+downloadFiles -Destination $Destination -ThreadCount $ThreadCount -GraphRootParam $GraphRoot
 $stopwatch.Stop()
-Write-Host -ForegroundColor White -BackgroundColor Red ("`nDownload COMPLETED in {0}" -f $stopwatch.Elapsed)
+Write-Host -ForegroundColor White -BackgroundColor Red ('`nDownload COMPLETED in {0}' -f $stopwatch.Elapsed)
 
 $stopwatchScript.Stop()
-Write-Host -ForegroundColor White -BackgroundColor Green ("`nScript COMPLETED in {0}" -f $stopwatchScript.Elapsed)
+Write-Host -ForegroundColor White -BackgroundColor Green ('`nScript COMPLETED in {0}' -f $stopwatchScript.Elapsed)
