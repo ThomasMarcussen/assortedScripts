@@ -6,6 +6,9 @@
 # ---------------------------------------------------------------------------------------------------------------
 # CHANGE LOG
 # ---------------------------------------------------------------------------------------------------------------
+# 2026-07-06
+#   - Restore creation and last-modified timestamps on files and update older timestamps on directories.
+#
 # 2025-10-28
 #   - Switch downloads to /content via Invoke-MgGraphRequest -OutputFilePath (no dependency on @microsoft.graph.downloadUrl).
 #   - Full support for OneDrive "shortcuts" (remoteItem): follow remote driveId/itemId for folders and files.
@@ -31,7 +34,11 @@
 param (
     [Parameter(Mandatory)] [string] $Username,
     [Parameter(Mandatory)] [string] $Destination,
-    [Parameter(Mandatory)] [int]    $ThreadCount
+    [Parameter(Mandatory)] [int]    $ThreadCount,
+    [Parameter()] [switch] $RestoreTimestamps,
+    [Parameter()] [string] $TenantId,
+    [Parameter()] [string] $ClientId,
+    [Parameter()] [string] $CertificateThumbPrint
 )
 
 # Script-scoped vars used across functions
@@ -39,6 +46,8 @@ $script:Username      = $Username
 $script:UserId        = $null
 $script:MGUserDriveID = $null
 $GraphRoot            = '/v1.0'
+
+$runspaceShared = [hashtable]::Synchronized(@{})
 
 # -------------------- Minimal Graph Authentication Bootstrap --------------------
 function Ensure-GraphAuth {
@@ -92,7 +101,9 @@ function Add-FolderRow {
     param(
         [Parameter(Mandatory)] [string] $FolderPath,
         [Parameter()] [string] $Name,
-        [Parameter()] [string] $WebUrl
+        [Parameter()] [string] $WebUrl,
+		[Parameter(Mandatory)] [string] $CreatedDateTime,
+		[Parameter(Mandatory)] [string] $LastModifiedDateTime
     )
 
     if (-not $Name) { $Name = Split-Path -Path $FolderPath -Leaf }
@@ -100,6 +111,8 @@ function Add-FolderRow {
         Name       = $Name
         WebUrl     = $WebUrl
         FolderPath = $FolderPath
+		CreatedDateTime       = $CreatedDateTime
+		LastModifiedDateTime  = $LastModifiedDateTime
     } | Export-Csv ('{0}_OD4B_Folders_Report.csv' -f $script:Username) -NoTypeInformation -Append
 }
 
@@ -108,7 +121,9 @@ function Add-FileRow {
         [Parameter(Mandatory)] [string] $DriveId,
         [Parameter(Mandatory)] [string] $ItemId,
         [Parameter(Mandatory)] [string] $RelativePath, # includes filename
-        [Parameter(Mandatory)] [string] $FileName
+        [Parameter(Mandatory)] [string] $FileName,
+		[Parameter(Mandatory)] [string] $CreatedDateTime,
+		[Parameter(Mandatory)] [string] $LastModifiedDateTime
     )
 
     [PSCustomObject]@{
@@ -116,6 +131,8 @@ function Add-FileRow {
         Path         = $RelativePath
         DriveItemID  = $ItemId
         DriveId      = $DriveId
+		CreatedDateTime       = $CreatedDateTime
+		LastModifiedDateTime  = $LastModifiedDateTime
     } | Export-Csv ('{0}_OD4B_Files_Report.csv' -f $script:Username) -NoTypeInformation -Append
 }
 
@@ -127,7 +144,7 @@ function Traverse-Drive {
         [Parameter()]            [string] $DisplayPath  # visible path in user's OneDrive view
     )
 
-    $select = 'id,name,size,folder,file,package,remoteItem,webUrl,parentReference'
+    $select = 'id,name,size,folder,file,package,remoteItem,webUrl,parentReference,fileSystemInfo'
     $uri = if ($ItemId) {
         ('{0}/drives/{1}/items/{2}/children?$select={3}' -f $GraphRoot, $DriveId, $ItemId, $select)
     } else {
@@ -135,12 +152,16 @@ function Traverse-Drive {
     }
 
     $children = Get-GraphPaged -RelativeUrl $uri
+    $filesTotal = 0
 
     foreach ($item in $children) {
         # If this is a shortcut to a remote folder
         if ($item.folder -and $item.remoteItem -and $item.remoteItem.folder) {
             $newPath = if ($DisplayPath) { ('{0}\{1}' -f $DisplayPath, $item.name) } else { $item.name }
-            Add-FolderRow -FolderPath $newPath -Name $item.name -WebUrl $item.webUrl
+            Add-FolderRow -FolderPath $newPath -Name $item.name -WebUrl $item.webUrl `
+				-CreatedDateTime $item.fileSystemInfo.CreatedDateTime.ToFileTimeUtc() `
+				-LastModifiedDateTime $item.fileSystemInfo.LastModifiedDateTime.ToFileTimeUtc()
+            $filesTotal += 1
 
             $remoteDriveId = $item.remoteItem.parentReference.driveId
             $remoteItemId  = $item.remoteItem.id
@@ -158,7 +179,10 @@ function Traverse-Drive {
             $remoteDriveId = $item.remoteItem.parentReference.driveId
             $remoteItemId  = $item.remoteItem.id
             if ($remoteDriveId -and $remoteItemId) {
-                Add-FileRow -DriveId $remoteDriveId -ItemId $remoteItemId -RelativePath $relPath -FileName $item.name
+                Add-FileRow -DriveId $remoteDriveId -ItemId $remoteItemId -RelativePath $relPath -FileName $item.name `
+					-CreatedDateTime $item.fileSystemInfo.CreatedDateTime.ToFileTimeUtc() `
+					-LastModifiedDateTime $item.fileSystemInfo.LastModifiedDateTime.ToFileTimeUtc()
+                $filesTotal += 1
             } else {
                 Write-Warning ('Shortcut file missing remote drive info: {0}' -f $item.name)
             }
@@ -168,7 +192,10 @@ function Traverse-Drive {
         # Regular folder in this drive
         if ($item.folder -and -not $item.remoteItem) {
             $newPath = if ($DisplayPath) { ('{0}\{1}' -f $DisplayPath, $item.name) } else { $item.name }
-            Add-FolderRow -FolderPath $newPath -Name $item.name -WebUrl $item.webUrl
+            Add-FolderRow -FolderPath $newPath -Name $item.name -WebUrl $item.webUrl `
+				-CreatedDateTime $item.fileSystemInfo.CreatedDateTime.ToFileTimeUtc() `
+				-LastModifiedDateTime $item.fileSystemInfo.LastModifiedDateTime.ToFileTimeUtc()
+            $filesTotal += 1
             Traverse-Drive -DriveId $DriveId -ItemId $item.id -DisplayPath $newPath
             continue
         }
@@ -176,13 +203,19 @@ function Traverse-Drive {
         # Regular file in this drive
         if ($item.file -and -not $item.remoteItem) {
             $relPath = if ($DisplayPath) { ('{0}\{1}' -f $DisplayPath, $item.name) } else { $item.name }
-            Add-FileRow -DriveId $DriveId -ItemId $item.id -RelativePath $relPath -FileName $item.name
+            Add-FileRow -DriveId $DriveId -ItemId $item.id -RelativePath $relPath -FileName $item.name `
+				-CreatedDateTime $item.fileSystemInfo.CreatedDateTime.ToFileTimeUtc() `
+				-LastModifiedDateTime $item.fileSystemInfo.LastModifiedDateTime.ToFileTimeUtc()
+            $filesTotal += 1
             continue
         }
 
         # Non-file things (packages, etc.)
         Write-Warning ('Skipping non-file item: {0} (id: {1})' -f $item.name, $item.id)
     }
+
+    $runspaceShared.filesTotal += $filesTotal
+
 }
 
 # -------------------- Local folder & batch creation --------------------
@@ -193,12 +226,50 @@ function createFolders {
     )
 
     $Folders = Import-Csv $OD4BFoldersReport
+	$UnixEpochFilesystemTime = 116444736000000000
+    foreach ($folderEntry in $Folders) {
+        if ([string]::IsNullOrWhiteSpace($folderEntry.FolderPath)) { continue }
+        $folderInfo = [System.IO.DirectoryInfo](Join-Path $Destination $folderEntry.FolderPath)
+		if (-not $folderInfo.Exists) {
+			$folderItem = New-Item -Path $folderInfo.FullName -ItemType Directory
+            if ($script:RestoreTimestamps) {
+			    $folderItem.CreationTime  = [System.DateTime]::FromFileTimeUtc($UnixEpochFilesystemTime)
+			    $folderItem.LastWriteTime = [System.DateTime]::FromFileTimeUtc($UnixEpochFilesystemTime)
+            }
+			Write-Host ('Folder ensured: {0}' -f $folderInfo.FullName) -ForegroundColor Cyan
+		} else {
+			Write-Host ('Folder pre-existed: {0}' -f $folderInfo.FullName) -ForegroundColor DarkCyan
+		}
+    }
+}
+
+function setFolderTime {
+    param(
+        [Parameter(Mandatory)] $OD4BFoldersReport,
+        [Parameter(Mandatory)] $Destination
+    )
+
+    if (-not $script:RestoreTimestamps) {
+        return
+    }
+
+    $Folders = Import-Csv $OD4BFoldersReport
+    $UnixEpochFilesystemTime = 116444736000000000
     foreach ($folderEntry in $Folders) {
         $folderPath = $folderEntry.FolderPath
         if ([string]::IsNullOrWhiteSpace($folderPath)) { continue }
-        $full = Join-Path $Destination $folderPath
-        New-Item -Path $full -ItemType Directory -ErrorAction SilentlyContinue | Out-Null
-        Write-Host ('Folder ensured: {0}' -f $full) -ForegroundColor Yellow
+        $folderInfo = [System.IO.DirectoryInfo](Join-Path $Destination $folderPath)
+		$folderItem = Get-Item -Path $folderInfo.FullName
+		$creationTime = [System.DateTime]::FromFileTimeUtc($folderEntry.CreatedDateTime)
+		$modifiedTime = [System.DateTime]::FromFileTimeUtc($folderEntry.LastModifiedDateTime)
+        if ($folderItem.CreationTime -le $UnixEpochFilesystemTime -or $creationTime -gt $folderItem.CreationTime) {
+            $folderItem.CreationTime = $creationTime
+            Write-Host ('Folder creation time changed: {0}' -f $folderInfo.FullName) -ForegroundColor DarkCyan
+        }
+	    if ($folderItem.LastWriteTime -le $UnixEpochFilesystemTime -or $modifiedTime -gt $folderItem.LastWriteTime) {
+            $folderItem.LastWriteTime = $modifiedTime
+            Write-Host ('Folder modification time changed: {0}' -f $folderInfo.FullName) -ForegroundColor DarkCyan
+        }
     }
 }
 
@@ -237,7 +308,8 @@ function downloadFiles {
         param(
             $list = $null,
             [string] $Destination,
-            [string] $GraphRootParam
+            [string] $GraphRootParam,
+            [object] $RunspaceJobState
         )
 
         # Ensure the auth cmdlet exists in the worker and use the existing session
@@ -264,6 +336,12 @@ function downloadFiles {
             try {
                 # Streams the content to disk using your current Graph session
                 Invoke-MgGraphRequest -Method GET -Uri $uri -OutputFilePath $localPath -ErrorAction Stop | Out-Null
+                $fileItem = Get-Item $localPath
+                if ($script:RestoreTimestamps) {
+				    $fileItem.CreationTime  = [System.DateTime]::FromFileTimeUtc($fileEntry.CreatedDateTime)
+				    $fileItem.LastWriteTime = [System.DateTime]::FromFileTimeUtc($fileEntry.LastModifiedDateTime)
+                }
+                $RunspaceJobState.filesProcessed += 1
             }
             catch {
                 Write-Warning ('Failed to download {0} to {1}. {2}' -f $fileName, $localPath, $_.Exception.Message)
@@ -285,7 +363,8 @@ function downloadFiles {
         $null = $PowerShell.AddScript($ScriptBlock).
             AddParameter('list', $batch).
             AddParameter('Destination', $Destination).
-            AddParameter('GraphRootParam', $GraphRootParam)
+            AddParameter('GraphRootParam', $GraphRootParam).
+            AddParameter('RunspaceJobState', $runspaceShared)
 
         $JobObj = [PSCustomObject]@{
             Runspace   = $PowerShell.BeginInvoke()
@@ -295,7 +374,9 @@ function downloadFiles {
     }
 
     while ($Jobs.Runspace.IsCompleted -contains $false) {
-        Write-Host ((Get-Date).ToString() + ' Still running...')
+        Write-Progress -Activity "Processing OD4B Account" `
+		    -Status "Restoring files" -CurrentOperation ("Downloading {0} of {1} files" -f ($runspaceShared.filesProcessed+1),$runspaceShared.filesTotal)  `
+			-PercentComplete ([math]::Min($runspaceShared.filesProcessed, $runspaceShared.filesTotal)/$runspaceShared.filesTotal*100)
         Start-Sleep 1
     }
 
@@ -315,8 +396,15 @@ Ensure-GraphAuth
 
 Write-Host "`nConnecting to Microsoft Graph API..."
 $requiredScopes = @('Files.Read.All', 'User.Read.All', 'Directory.Read.All')
-Connect-MgGraph -Scopes $requiredScopes
-Write-Host 'Connected successfully.'
+if (-not [string]::IsNullOrWhiteSpace($script:CertificateThumbPrint)) {
+    Connect-MgGraph -NoWelcome `
+			-TenantId $script:TenantId -ClientId $script:ClientId `
+			-CertificateThumbPrint $script:CertificateThumbPrint
+} else {
+    Connect-MgGraph -Scopes $requiredScopes -NoWelcome
+}
+Write-Host -ForegroundColor Green 'Connected successfully.'
+
 
 # Optional: warn if scopes missing
 try {
@@ -346,6 +434,9 @@ try {
 Write-Host ('User ID: {0}' -f $script:UserId)
 Write-Host ('Drive ID: {0}' -f $script:MGUserDriveID)
 
+$runspaceShared.filesProcessed = 0
+$runspaceShared.filesTotal = 0
+
 # Prepare destination and reports
 if (-not (Test-Path -LiteralPath $Destination)) {
     New-Item -Path $Destination -ItemType Directory | Out-Null
@@ -358,13 +449,13 @@ foreach ($rep in @($foldersReport, $filesReport)) {
 }
 
 # Enumerate OneDrive content (root -> recurse); handles remoteItem
-Write-Host -ForegroundColor White -BackgroundColor Red "`nFetching OneDrive content (this may take a while)..."
+Write-Host -ForegroundColor Green "`nFetching OneDrive content (this may take a while)..."
 $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 
 Traverse-Drive -DriveId $script:MGUserDriveID -ItemId $null -DisplayPath ''
 
 $stopwatch.Stop()
-Write-Host -ForegroundColor White -BackgroundColor Red ('`nFetching OneDrive content COMPLETED in {0}' -f $stopwatch.Elapsed)
+Write-Host -ForegroundColor Green ("`nFetching OneDrive content COMPLETED in {0}" -f $stopwatch.Elapsed)
 
 # Recreate folder tree locally and split into batches for parallel downloads
 createFolders -OD4BFoldersReport $foldersReport -Destination $Destination
@@ -374,7 +465,12 @@ createBatches -OD4BFilesReport   $filesReport   -ThreadCount $ThreadCount
 $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 downloadFiles -Destination $Destination -ThreadCount $ThreadCount -GraphRootParam $GraphRoot
 $stopwatch.Stop()
-Write-Host -ForegroundColor White -BackgroundColor Red ('`nDownload COMPLETED in {0}' -f $stopwatch.Elapsed)
+Write-Host -ForegroundColor Green ("`nDownload COMPLETED in {0}" -f $stopwatch.Elapsed)
+
+$stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+setFolderTime -OD4BFoldersReport $foldersReport -Destination $Destination
+$stopwatch.Stop()
+Write-Host -ForegroundColor Green ("`nFolders UPDATED in {0}" -f $stopwatch.Elapsed)
 
 $stopwatchScript.Stop()
-Write-Host -ForegroundColor White -BackgroundColor Green ('`nScript COMPLETED in {0}' -f $stopwatchScript.Elapsed)
+Write-Host -ForegroundColor Blue ("`nScript COMPLETED in {0}" -f $stopwatchScript.Elapsed)
